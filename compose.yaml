@@ -1,0 +1,23 @@
+services:
+  shortbot:
+    image: ${SHORTBOT_IMAGE:-ghcr.io/snailboob/shortbot:latest}
+    restart: unless-stopped
+    environment:
+      EXCHANGE: ${EXCHANGE:-bitunix} # bitunix, binance, bybit, hyperliquid
+      QUOTE_CURRENCIES: ${QUOTE_CURRENCIES:-USDT,USD,USDC,BTC}
+      INCREASE_THRESHOLD: ${INCREASE_THRESHOLD:-100}
+      VOLUME_THRESHOLD: ${VOLUME_THRESHOLD:-10000000}
+      TZ: ${TZ:-UTC}
+      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}
+      NTFY_TOPIC: ${NTFY_TOPIC:?Set your own NTFY_TOPIC in .env}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+    volumes:
+      - shortbot-data:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  shortbot-data:
