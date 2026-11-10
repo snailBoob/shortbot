@@ -2,7 +2,7 @@
 
 import argparse
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from email.header import Header
@@ -20,7 +20,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from exchanges import EXCHANGES, USD_QUOTES, fetch_markets
+from exchanges import EXCHANGES, USD_QUOTES, fetch_hour_high, fetch_markets
 
 
 LOG = logging.getLogger("shortbot")
@@ -35,6 +35,9 @@ class Alert:
     volume: Decimal
     exchange: str = "bitunix"
     base: str = ""
+    reference_price: Decimal = Decimal("0")
+    market_symbol: str = ""
+    market_type: str = ""
 
     @property
     def ticker(self):
@@ -92,7 +95,8 @@ def select_alerts(rows, exchange="bitunix", quotes=("USDT", "USD", "USDC", "BTC"
                 raise ValueError("Invalid ticker value")
             increase = (price / opening - 1) * 100
             if increase > increase_threshold and volume >= volume_threshold:
-                alerts.append(Alert(symbol, increase, volume, exchange, row.get("base", symbol[:-len(currency)])))
+                alerts.append(Alert(symbol, increase, volume, exchange, row.get("base", symbol[:-len(currency)]),
+                                    opening, row.get("market_symbol", symbol), row.get("market_type", "")))
         except (KeyError, TypeError, ValueError, InvalidOperation):
             LOG.warning("Skipping invalid ticker: %r", row)
     return sorted(alerts, key=lambda alert: alert.symbol)
@@ -141,7 +145,20 @@ def reserve(db, symbol, now):
     return cursor.rowcount == 1
 
 
-def scan(db, server, topic, *, fetch=None, send=publish, clock=time.time, **selection):
+def with_hourly_high(alert, hour_end, fetch_high=fetch_hour_high):
+    try:
+        high = fetch_high(alert.exchange, alert.market_symbol, alert.market_type, hour_end)
+        return replace(alert, increase=(high / alert.reference_price - 1) * 100)
+    except (OSError, ValueError, InvalidOperation) as error:
+        LOG.warning("Hourly high unavailable for %s (UTC hour ending %s); "
+                    "using ticker increase %.2f%%: %s", alert.ticker, hour_end, alert.increase, error)
+        return alert
+
+
+def scan(db, server, topic, *, fetch=None, send=publish, clock=time.time,
+         fetch_high=fetch_hour_high, **selection):
+    # Freeze the interval before API calls, even if a slow scan crosses an hour boundary.
+    hour_end = int(clock()) // 3600 * 3600
     if fetch is None:
         fetch = lambda: fetch_markets(selection.get("exchange", "bitunix"))
     alerts = select_alerts(fetch(), **selection)
@@ -151,6 +168,7 @@ def scan(db, server, topic, *, fetch=None, send=publish, clock=time.time, **sele
             break
         if not reserve(db, alert.cooldown_key, clock()):
             continue
+        alert = with_hourly_high(alert, hour_end, fetch_high)
         try:
             send(alert, server, topic)
         except HTTPError as error:
@@ -217,10 +235,11 @@ def main():
     logging.basicConfig(level=logging.INFO, handlers=[handler])
     fetch = lambda: fetch_markets(selection["exchange"])
     if args.dry_run:
+        hour_end = int(time.time()) // 3600 * 3600
         rows = fetch()
         alerts = select_alerts(rows, **selection)
         for alert in alerts:
-            print(alert.message, end="\n\n")
+            print(with_hourly_high(alert, hour_end).message, end="\n\n")
         LOG.info("Dry run %s: %d active perpetuals, %d qualifying pairs", selection["exchange"], len(rows), len(alerts))
         return
 

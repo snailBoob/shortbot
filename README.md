@@ -22,10 +22,24 @@ market data without an API key. Requires Python 3.11+; no third-party Python pac
   without a currency label. Only the ticker link opens TradingView; no extra
   buttons are added. The ntfy client determines whether the link opens in a new
   tab. Support for Markdown in message bodies varies between ntfy clients.
+- After the existing ticker filters and cooldown check pass, fetches the high
+  of the last fully closed UTC one-hour candle for that contract. The displayed
+  increase is `(hourly high / original ticker reference price - 1) * 100`.
+  The signal still uses the rolling 24-hour ticker increase with a strict `>`
+  threshold; it is not re-evaluated using the hourly high or exact candle closes.
+- If candle data is missing, invalid, or unavailable, sends the original
+  ticker-based alert and logs a warning. The normal delivery and cooldown rules
+  apply to both enriched and fallback alerts.
+
+Hourly-high enrichment is available starting with `v0.3.0`. Earlier releases
+display the original ticker-based increase.
 
 The API call starts on the hour. API, network, and push delays mean delivery
 exactly at `HH:00:00` is not guaranteed. Scheduling and logs use UTC by default;
 `TZ` determines local hour boundaries, including half-hour time zones and DST.
+Exchange candles use UTC hour boundaries. Each scan fixes its candle interval
+before fetching market data; even in half-hour time zones it selects the most
+recent fully closed UTC hour, not a candle that is still forming.
 
 ## Configuration
 
@@ -66,6 +80,15 @@ Hyperliquid uses its native perpetual market (not HIP-3 builder markets),
 volume. This market is USDC-quoted; an example TradingView ticker is
 `HYPERLIQUID:BTCUSDC.P`. Other exchanges use their own prefixes. Availability of
 every new or small pair on TradingView is not guaranteed.
+
+Hourly highs use traded-price candles on all four exchanges. Hyperliquid keeps
+its existing mark-price-based selection and `prevDayPx` reference, but uses the
+trade-price candle high for the displayed increase. Candle requests preserve
+native contract identifiers, including Binance COIN-M symbols, Bybit USDC
+symbols, and case-sensitive Hyperliquid coin names. Each alert outside its
+cooldown requires one additional request; no candles are fetched for rejected
+or suppressed signals. API failures, including rate limits, use the logged
+fallback described above.
 
 ## Installing with Docker
 
@@ -117,7 +140,7 @@ Compose defaults to `ghcr.io/snailboob/shortbot:latest`. To download it directly
 docker pull ghcr.io/snailboob/shortbot:latest
 ```
 
-To pin a version, set `SHORTBOT_IMAGE=ghcr.io/snailboob/shortbot:v0.2.0` in `.env`.
+To pin a version, set `SHORTBOT_IMAGE=ghcr.io/snailboob/shortbot:v0.3.0` in `.env`.
 
 The startup log shows the exchange, quote currencies, and first scheduled check.
 Compose uses the Docker host's default logging driver. On Synology, this is
@@ -136,7 +159,7 @@ cooldowns: it deletes the volume. Back up the volume while the bot is stopped.
 ### App suite integration
 
 Copy the service and volume from `compose.yaml` into your app suite. Use
-`ghcr.io/snailboob/shortbot:v0.2.0`, inject the environment variables, and mount
+`ghcr.io/snailboob/shortbot:v0.3.0`, inject the environment variables, and mount
 a persistent volume at `/data`. The container runs as UID 10001; when using a
 bind mount, that user must have write access to the host directory. The default
 named volume handles this on first startup. No port mappings are required.
@@ -195,7 +218,8 @@ python3 shortbot.py
 ```
 
 Dry-run fetches real market data and prints matches, but sends nothing and does
-not write state. The default local state path is `data/shortbot.sqlite3`;
+not write state. It also fetches hourly highs for qualifying pairs and uses the
+same fallback, without applying stored cooldowns. The default local state path is `data/shortbot.sqlite3`;
 override it with `STATE_PATH`. For local execution, set environment variables
 in your shell; Python does not automatically load `.env`.
 
@@ -224,3 +248,8 @@ cooldown starts at the acknowledgment time. Errors appear in the container logs.
 - [Binance USD-M](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/24hr-Ticker-Price-Change-Statistics)
 - [Bybit tickers](https://bybit-exchange.github.io/docs/v5/market/tickers)
 - [Hyperliquid perpetuals](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals)
+- [Bitunix Kline](https://www.bitunix.com/api-docs/futures/market/get_kline.html)
+- [Binance USD-M Klines](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Kline-Candlestick-Data)
+- [Binance COIN-M Klines](https://developers.binance.com/docs/derivatives/coin-margined-futures/market-data/rest-api/Kline-Candlestick-Data)
+- [Bybit Kline](https://bybit-exchange.github.io/docs/v5/market/kline)
+- [Hyperliquid Candle Snapshot](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#candle-snapshot)

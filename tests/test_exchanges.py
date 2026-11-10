@@ -2,7 +2,8 @@ from datetime import datetime
 from decimal import Decimal
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 import exchanges
@@ -22,6 +23,7 @@ class AdapterTest(unittest.TestCase):
         result, = exchanges.fetch_markets("bitunix", get)
         self.assertEqual(result["quote"], "BTC")
         self.assertEqual(result["quoteVol"], "200")
+        self.assertEqual(result["market_symbol"], "ETHBTC")
 
     def test_binance_inverse_contracts_to_usd_and_excludes_expiry(self):
         def get(url):
@@ -38,6 +40,8 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual([r["symbol"] for r in rows], ["ETHUSDT", "BTCUSD"])
         self.assertEqual(Decimal(rows[1]["quoteVol"]), 15_000_000)
         self.assertEqual(Decimal(rows[0]["quoteVol"]), 12_345_678)
+        self.assertEqual([(r["market_symbol"], r["market_type"]) for r in rows],
+                         [("ETHUSDT", "fapi"), ("BTCUSD_PERP", "dapi")])
 
     def test_bybit_pagination_usdc_symbols_and_inverse_quote_volume(self):
         calls = []
@@ -60,6 +64,10 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual([r["symbol"] for r in rows], ["ETHUSDC", "BTCUSD"])
         self.assertEqual(rows[1]["quoteVol"], "12000000")
         self.assertEqual(rows[0]["quoteVol"], "15000000")
+        alert, = shortbot.select_alerts(rows, exchange="bybit", quotes=("USDC",))
+        self.assertEqual((alert.market_symbol, alert.market_type), ("ETHPERP", "linear"))
+        self.assertEqual(alert.reference_price, Decimal("1"))
+        self.assertEqual(rows[1]["market_type"], "inverse")
 
     def test_hyperliquid_mark_price_and_delisted_filter(self):
         def get(url, body):
@@ -69,6 +77,7 @@ class AdapterTest(unittest.TestCase):
         result, = exchanges.fetch_markets("hyperliquid", get)
         self.assertEqual(result["symbol"], "KPEPEUSDC")
         self.assertEqual(result["lastPrice"], "3")
+        self.assertEqual(result["market_symbol"], "kPEPE")
 
     def test_api_failures_are_not_silent_empty_success(self):
         for exchange in exchanges.EXCHANGES:
@@ -77,6 +86,71 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             exchanges.fetch_markets("lbank")
 
+
+class HourHighTest(unittest.TestCase):
+    # The requested closed hour is 01:00-02:00 UTC on the Unix epoch date.
+    start = 3_600_000
+    end = 7_200_000
+
+    def test_bitunix_closed_hour_and_trade_price_request(self):
+        get = Mock(return_value={"code": 0, "data": [{"time": self.start, "high": "2.29"}]})
+        self.assertEqual(exchanges.fetch_hour_high("bitunix", "INITUSDT", "", 7200, get), Decimal("2.29"))
+        url = urlsplit(get.call_args.args[0])
+        self.assertEqual(url.path, "/api/v1/futures/market/kline")
+        self.assertEqual(parse_qs(url.query), {"symbol": ["INITUSDT"], "interval": ["1h"],
+            "endTime": [str(self.end)], "limit": ["1"], "type": ["LAST_PRICE"]})
+
+    def test_binance_usdm_and_coinm_contract_routing(self):
+        for market, symbol in (("fapi", "INITUSDT"), ("dapi", "BTCUSD_PERP")):
+            with self.subTest(market=market):
+                get = Mock(return_value=[[self.start, "1", "2.29", "1", "2.02", "10", self.end - 1]])
+                self.assertEqual(exchanges.fetch_hour_high("binance", symbol, market, 7200, get), Decimal("2.29"))
+                url = urlsplit(get.call_args.args[0])
+                self.assertEqual(url.netloc, market + ".binance.com")
+                self.assertEqual(url.path, f"/{market}/v1/klines")
+                self.assertEqual(parse_qs(url.query), {"symbol": [symbol], "interval": ["1h"],
+                    "startTime": [str(self.start)], "endTime": [str(self.end - 1)], "limit": ["1"]})
+
+    def test_bybit_linear_usdc_and_inverse_contract_routing(self):
+        for category, symbol in (("linear", "ETHPERP"), ("inverse", "BTCUSD")):
+            with self.subTest(category=category):
+                get = Mock(return_value={"retCode": 0, "result": {"list": [[str(self.start), "1", "2.29"]]}})
+                self.assertEqual(exchanges.fetch_hour_high("bybit", symbol, category, 7200, get), Decimal("2.29"))
+                url = urlsplit(get.call_args.args[0])
+                self.assertEqual(url.path, "/v5/market/kline")
+                self.assertEqual(parse_qs(url.query), {"category": [category], "symbol": [symbol],
+                    "interval": ["60"], "start": [str(self.start)], "end": [str(self.end - 1)], "limit": ["1"]})
+
+    def test_hyperliquid_preserves_native_coin_case(self):
+        get = Mock(return_value=[{"t": self.start, "T": self.end - 1, "s": "kPEPE", "i": "1h", "h": "2.29"}])
+        self.assertEqual(exchanges.fetch_hour_high("hyperliquid", "kPEPE", "", 7200, get), Decimal("2.29"))
+        get.assert_called_once_with("https://api.hyperliquid.xyz/info", {"type": "candleSnapshot", "req": {
+            "coin": "kPEPE", "interval": "1h", "startTime": self.start, "endTime": self.end - 1}})
+
+    def test_missing_stale_forming_malformed_and_invalid_candles_are_rejected(self):
+        for exchange, symbol, market in (("bitunix", "BTCUSDT", ""), ("binance", "BTCUSDT", "fapi"),
+                                        ("bybit", "BTCUSDT", "linear"), ("hyperliquid", "BTC", "")):
+            def payload(timestamp, high):
+                if exchange == "bitunix":
+                    return {"code": 0, "data": [{"time": timestamp, "high": high}]}
+                if exchange == "binance":
+                    return [[timestamp, "1", high, "1", "2", "10", timestamp + 3_600_000 - 1]]
+                if exchange == "bybit":
+                    return {"retCode": 0, "result": {"list": [[str(timestamp), "1", high]]}}
+                return [{"t": timestamp, "T": timestamp + 3_600_000 - 1, "s": symbol, "i": "1h", "h": high}]
+            responses = [{}, [], payload(0, "2"), payload(self.end, "2")]
+            responses += [payload(self.start, v) for v in (None, "NaN", "Infinity", "0", "-1", "oops")]
+            for response in responses:
+                with self.subTest(exchange=exchange, response=response), self.assertRaises(ValueError):
+                    exchanges.fetch_hour_high(exchange, symbol, market, 7200, Mock(return_value=response))
+
+    def test_exchange_error_and_wrong_hyperliquid_identity_are_rejected(self):
+        cases = [("bitunix", "", {"code": 1, "data": [{"time": self.start, "high": "2"}]}),
+                 ("bybit", "linear", {"retCode": 1, "result": {"list": [[self.start, "1", "2"]]}}),
+                 ("hyperliquid", "", [{"t": self.start, "T": self.end - 1, "s": "WRONG", "i": "1h", "h": "2"}])]
+        for exchange, market, response in cases:
+            with self.subTest(exchange=exchange), self.assertRaises(ValueError):
+                exchanges.fetch_hour_high(exchange, "BTC", market, 7200, Mock(return_value=response))
 
 class SelectionTest(unittest.TestCase):
     def test_btc_is_quote_not_base_and_volume_converted_before_threshold(self):

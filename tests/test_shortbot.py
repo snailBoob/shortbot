@@ -2,6 +2,7 @@ from contextlib import closing
 from decimal import Decimal
 from email.header import decode_header, make_header
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -56,12 +57,13 @@ class CooldownTest(unittest.TestCase):
         self.db = shortbot.open_state(self.path)
         self.addCleanup(self.db.close)
         self.send = Mock()
+        self.high = Mock(return_value=Decimal("2.01"))
         self.now = 1_000_000
 
     def scan(self, rows=None):
         return shortbot.scan(self.db, "https://ntfy.test", "Shortbot",
                              fetch=lambda: rows if rows is not None else [ticker()],
-                             send=self.send, clock=lambda: self.now)
+                             send=self.send, clock=lambda: self.now, fetch_high=self.high)
 
     def test_restart_and_exact_24_hour_boundary(self):
         self.assertEqual(self.scan(), 1)
@@ -110,6 +112,57 @@ class CooldownTest(unittest.TestCase):
             shortbot.scan(self.db, "", "", fetch=Mock(side_effect=ValueError("API failure")))
         self.assertEqual(self.db.execute("SELECT count(*) FROM alerts").fetchone()[0], 0)
 
+    def test_hourly_high_changes_message_not_selection_or_cooldown(self):
+        self.high.return_value = Decimal("2.29")
+        self.assertEqual(self.scan([ticker(price="2.0235")]), 1)
+        alert = self.send.call_args.args[0]
+        self.assertEqual(alert.increase, Decimal("129"))
+        self.assertIn("Increase: 129.00%", alert.message)
+        self.assertEqual(alert.volume, Decimal("10000000"))
+        self.high.assert_called_once_with("bitunix", "AKEUSDT", "", self.now // 3600 * 3600)
+        self.assertEqual(self.scan(), 0)
+        self.assertEqual(self.high.call_count, 1)
+
+    def test_no_candle_requests_for_rejected_candidates(self):
+        self.assertEqual(self.scan([ticker(price="2"), ticker(volume="9999999")]), 0)
+        self.high.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_hourly_high_does_not_reapply_signal_threshold(self):
+        self.high.return_value = Decimal("1.99")
+        self.assertEqual(self.scan(), 1)
+        self.assertEqual(self.send.call_args.args[0].increase, Decimal("99"))
+
+    def test_candle_failure_falls_back_and_keeps_cooldown(self):
+        for failure in (ValueError("Missing candle"), TimeoutError("Timed out"),
+                        HTTPError("https://market.test", 429, "Rate limited", {}, None)):
+            with self.subTest(failure=failure):
+                self.db.execute("DELETE FROM alerts")
+                self.db.commit()
+                self.high.reset_mock()
+                self.high.side_effect = failure
+                with self.assertLogs("shortbot", level="WARNING") as logs:
+                    self.assertEqual(self.scan(), 1)
+                self.assertIn("using ticker increase 101.00%", logs.output[0])
+                self.assertIn("BITUNIX:AKEUSDT.P", logs.output[0])
+                self.assertEqual(self.send.call_args.args[0].increase, Decimal("101"))
+                self.assertEqual(self.scan(), 0)
+                self.assertEqual(self.high.call_count, 1)
+                self.assertEqual(self.db.execute("SELECT status FROM alerts").fetchone()[0], "sent")
+
+    def test_candle_failure_does_not_stop_other_alerts(self):
+        self.high.side_effect = [ValueError("Missing candle"), Decimal("2.29")]
+        with self.assertLogs("shortbot", level="WARNING"):
+            self.assertEqual(self.scan([ticker(), ticker(symbol="BIRBUSDT")]), 2)
+        self.assertEqual([call.args[0].increase for call in self.send.call_args_list],
+                         [Decimal("101"), Decimal("129")])
+
+    def test_scan_freezes_candle_hour_before_slow_market_request(self):
+        clock = Mock(side_effect=[7199, 7201, 7202])
+        shortbot.scan(self.db, "", "", fetch=lambda: [ticker()], send=self.send,
+                      clock=clock, fetch_high=self.high)
+        self.high.assert_called_once_with("bitunix", "AKEUSDT", "", 3600)
+
 
 class HttpTest(unittest.TestCase):
     def setUp(self):
@@ -117,6 +170,8 @@ class HttpTest(unittest.TestCase):
         self.market = {"code": 0, "data": [ticker()]}
         self.ack = {"id": "test-id", "event": "message"}
         self.required_token = None
+        self.candle_requests = []
+        self.candles = [{"time": 3_600_000, "high": "2.29"}]
         self.env = patch.dict(os.environ, {"NTFY_TOKEN": ""})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -126,6 +181,9 @@ class HttpTest(unittest.TestCase):
             def do_GET(self):
                 if self.path.endswith("trading_pairs"):
                     self.respond({"code": 0, "data": [{"symbol": "AKEUSDT", "base": "AKE", "quote": "USDT", "symbolStatus": "OPEN"}]})
+                elif self.path.startswith("/kline?"):
+                    owner.candle_requests.append(self.path)
+                    self.respond({"code": 0, "data": owner.candles})
                 else:
                     self.respond(owner.market)
 
@@ -159,13 +217,18 @@ class HttpTest(unittest.TestCase):
     def fetch(self):
         return exchanges.fetch_markets("bitunix", lambda url: exchanges.request_json(self.url + "/" + url.rsplit("/", 1)[-1]))
 
+    def fetch_high(self, exchange, symbol, market_type, hour_end):
+        return exchanges.fetch_hour_high(exchange, symbol, market_type, hour_end,
+            get=lambda url: exchanges.request_json(self.url + "/" + url.rsplit("/", 1)[-1]))
+
     def test_end_to_end_http_and_persistent_dedup(self):
         with tempfile.TemporaryDirectory() as tmp:
             with closing(shortbot.open_state(str(Path(tmp) / "state.db"))) as db:
                 for _ in range(2):
                     shortbot.scan(db, self.url, "Shortbot",
-                                  fetch=self.fetch)
+                                  fetch=self.fetch, fetch_high=self.fetch_high, clock=lambda: 7200)
         self.assertEqual(len(self.posts), 1)
+        self.assertEqual(len(self.candle_requests), 1)
         path, headers, body = self.posts[0]
         self.assertEqual(path, "/Shortbot")
         self.assertEqual(headers["Markdown"], "yes")
@@ -174,9 +237,17 @@ class HttpTest(unittest.TestCase):
         self.assertIsNone(headers["Actions"])
         self.assertIsNone(headers["Authorization"])
         self.assertIn("[BITUNIX:AKEUSDT.P](https://www.tradingview.com/chart/?symbol=BITUNIX%3AAKEUSDT.P)", body)
-        self.assertIn("Increase: 101.00%", body)
+        self.assertIn("Increase: 129.00%", body)
         self.assertIn("Volume: 10,000,000.00", body)
         self.assertFalse(body.endswith(" USDT"))
+
+    def test_missing_candle_still_delivers_original_alert_over_http(self):
+        self.candles = []
+        with closing(shortbot.open_state(":memory:")) as db:
+            with self.assertLogs("shortbot", level="WARNING"):
+                self.assertEqual(shortbot.scan(db, self.url, "Shortbot", fetch=self.fetch,
+                    fetch_high=self.fetch_high, clock=lambda: 7200), 1)
+        self.assertIn("Increase: 101.00%", self.posts[0][2])
 
     def test_unsuccessful_api_response(self):
         for market in ({"code": 1, "data": []}, {"code": 0, "data": []}, {"code": 0, "data": {}}):
@@ -203,6 +274,25 @@ class HttpTest(unittest.TestCase):
         self.ack = {"error": "not accepted"}
         with self.assertRaises(ValueError):
             shortbot.publish(shortbot.select_alerts([ticker()])[0], self.url, "Shortbot")
+
+
+class DryRunTest(unittest.TestCase):
+    def test_dry_run_uses_enrichment_without_state_or_publication(self):
+        # Exercise the actual main path while all exchange requests stay in-process.
+        with patch.dict(os.environ, {}, clear=True), patch("sys.argv", ["shortbot.py", "--dry-run"]), \
+             patch.object(shortbot, "fetch_markets", return_value=[ticker()]), \
+             patch.object(shortbot, "open_state") as state, patch.object(shortbot, "publish") as send, \
+             patch("sys.stdout", new_callable=io.StringIO) as output, \
+             patch.object(shortbot.time, "time", return_value=7200), \
+             patch.object(shortbot.logging, "basicConfig"):
+            # fetch_hour_high's default transport is bound at definition time.
+            with patch("exchanges.urlopen") as opened:
+                opened.return_value.__enter__.return_value.read.return_value = json.dumps({
+                    "code": 0, "data": [{"time": 3_600_000, "high": "2.29"}]}).encode()
+                shortbot.main()
+            self.assertIn("Increase: 129.00%", output.getvalue())
+            state.assert_not_called()
+            send.assert_not_called()
 
 
 if __name__ == "__main__":
