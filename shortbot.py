@@ -20,7 +20,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-from exchanges import EXCHANGES, USD_QUOTES, fetch_hour_high, fetch_markets
+from exchanges import EXCHANGES, USD_QUOTES, binance_closed_hours, fetch_hour_high, fetch_markets
 
 
 LOG = logging.getLogger("shortbot")
@@ -68,7 +68,7 @@ def select_alerts(rows, exchange="bitunix", quotes=("USDT", "USD", "USDC", "BTC"
     for row in rows:
         if isinstance(row, dict) and row.get("base") == "BTC" and row.get("quote") in USD_QUOTES:
             try:
-                value = Decimal(row["lastPrice"])
+                value = Decimal(row.get("close", row["lastPrice"]))
                 if value.is_finite() and value > 0:
                     btc_usd = value
                     break
@@ -94,7 +94,8 @@ def select_alerts(rows, exchange="bitunix", quotes=("USDT", "USD", "USDC", "BTC"
             if opening <= 0 or price <= 0 or volume < 0:
                 raise ValueError("Invalid ticker value")
             increase = (price / opening - 1) * 100
-            if increase > increase_threshold and volume >= volume_threshold:
+            passes = increase >= increase_threshold if exchange == 'binance' else increase > increase_threshold
+            if passes and volume >= volume_threshold:
                 alerts.append(Alert(symbol, increase, volume, exchange, row.get("base", symbol[:-len(currency)]),
                                     opening, row.get("market_symbol", symbol), row.get("market_type", "")))
         except (KeyError, TypeError, ValueError, InvalidOperation):
@@ -155,12 +156,19 @@ def with_hourly_high(alert, hour_end, fetch_high=fetch_hour_high):
         return alert
 
 
+def scan_rows(selection, hour_end):
+    exchange = selection.get('exchange', 'bitunix')
+    if exchange == 'binance':
+        return binance_closed_hours(hour_end, selection.get('quotes', ('USDT', 'USD', 'USDC', 'BTC')))
+    return fetch_markets(exchange)
+
+
 def scan(db, server, topic, *, fetch=None, send=publish, clock=time.time,
          fetch_high=fetch_hour_high, **selection):
     # Freeze the interval before API calls, even if a slow scan crosses an hour boundary.
     hour_end = int(clock()) // 3600 * 3600
     if fetch is None:
-        fetch = lambda: fetch_markets(selection.get("exchange", "bitunix"))
+        fetch = lambda: scan_rows(selection, hour_end)
     alerts = select_alerts(fetch(), **selection)
     sent = 0
     for alert in alerts:
@@ -168,7 +176,8 @@ def scan(db, server, topic, *, fetch=None, send=publish, clock=time.time,
             break
         if not reserve(db, alert.cooldown_key, clock()):
             continue
-        alert = with_hourly_high(alert, hour_end, fetch_high)
+        if alert.exchange != 'binance':
+            alert = with_hourly_high(alert, hour_end, fetch_high)
         try:
             send(alert, server, topic)
         except HTTPError as error:
@@ -233,13 +242,12 @@ def main():
     handler = logging.StreamHandler()
     handler.setFormatter(ZonedFormatter(timezone))
     logging.basicConfig(level=logging.INFO, handlers=[handler])
-    fetch = lambda: fetch_markets(selection["exchange"])
     if args.dry_run:
         hour_end = int(time.time()) // 3600 * 3600
-        rows = fetch()
+        rows = scan_rows(selection, hour_end)
         alerts = select_alerts(rows, **selection)
         for alert in alerts:
-            print(with_hourly_high(alert, hour_end).message, end="\n\n")
+            print((alert if alert.exchange == 'binance' else with_hourly_high(alert, hour_end)).message, end="\n\n")
         LOG.info("Dry run %s: %d active perpetuals, %d qualifying pairs", selection["exchange"], len(rows), len(alerts))
         return
 
@@ -262,7 +270,7 @@ def main():
             # Skip old scans after suspension instead of issuing stale notifications.
             if time.time() - target < 60:
                 try:
-                    scan(db, server, topic, fetch=fetch, **selection)
+                    scan(db, server, topic, **selection)
                 except (OSError, ValueError) as error:
                     LOG.error("Hourly scan failed: %s; retry at the next hour", error)
             target = next_hour(time.time(), timezone)

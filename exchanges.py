@@ -1,6 +1,8 @@
 """Public perpetual market data, normalized at the exchange boundary."""
 
 import json
+import logging
+from urllib.error import HTTPError
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -53,6 +55,40 @@ def binance(get):
             rows.append(row(m["baseAsset"] + m["quoteAsset"], m["baseAsset"], m["quoteAsset"],
                             t["openPrice"], t["lastPrice"], volume,
                             market_symbol=t["symbol"], market_type=api))
+    return rows
+
+
+def binance_closed_hours(end, quotes, get=request_json):
+    """Read the same 25 closed UTC hours for every eligible perpetual."""
+    rows = []
+    start = (end - 25 * 3600) * 1000
+    for api in ('fapi', 'dapi'):
+        root = f'https://{api}.binance.com/{api}/v1/'
+        for m in get(root + 'exchangeInfo')['symbols']:
+            base, quote = m['baseAsset'], m['quoteAsset']
+            if (m['contractType'] != 'PERPETUAL' or m.get('status', m.get('contractStatus')) != 'TRADING'
+                    or quote not in quotes and not (base == 'BTC' and quote in USD_QUOTES and 'BTC' in quotes)):
+                continue
+            params = urlencode(dict(symbol=m['symbol'], interval='1h', startTime=start, endTime=end*1000-1, limit=25))
+            try:
+                candles = get(root + 'klines?' + params)
+            except HTTPError as error:
+                if error.code in (418, 429):
+                    raise
+                logging.warning('Skipping %s ending %s: %s', m['symbol'], end, error)
+                continue
+            except (OSError, ValueError) as error:
+                logging.warning('Skipping %s ending %s: %s', m['symbol'], end, error)
+                continue
+            if [c[0] for c in candles] != [start + i*3600000 for i in range(25)]:
+                logging.warning('Incomplete candle history: %s ending %s', m['symbol'], end)
+                continue
+            volume = (sum(Decimal(c[5]) for c in candles[1:]) * Decimal(str(m['contractSize'])) if api == 'dapi'
+                      else sum(Decimal(c[7]) for c in candles[1:]))
+            record = row(base+quote, base, quote, candles[0][3], candles[-1][2], volume,
+                         market_symbol=m['symbol'], market_type=api)
+            record['close'] = candles[-1][4]
+            rows.append(record)
     return rows
 
 

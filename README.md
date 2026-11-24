@@ -7,7 +7,12 @@ market data without an API key. Requires Python 3.11+; no third-party Python pac
 ## Behavior
 
 - Checks on the hour, starting at the next full hour after startup.
-- Uses current rolling 24-hour perpetual market statistics, not an exact
+- On Binance, at each UTC hour close compare the high of the just-closed hour
+  with the low of the same hour one day earlier. Both the increase threshold
+  and the 24 closed hours' turnover threshold are inclusive. Missing candles
+  do not fall back to a ticker signal. The notification shows the signal increase.
+- The rolling ticker selection and hourly-high enrichment below apply to the
+  other exchanges. They use current rolling 24-hour perpetual market statistics, not an exact
   historical candle-close calculation.
 - Default filters: price increase **greater than 100%** and 24-hour turnover of
   **at least 10,000,000 USD-equivalent**. Both thresholds are configurable.
@@ -58,7 +63,7 @@ TZ: UTC
   `BTC` means ETH/BTC, not BTC/USDT or a contract settled in BTC. Only pairs
   actually offered as perpetuals by the exchange are included. Supported values:
   USD, USDT, USDC, BUSD, FDUSD, TUSD, DAI, USDE, and USD1.
-- `INCREASE_THRESHOLD`: percentage without a % sign; comparison is strictly `>`.
+- `INCREASE_THRESHOLD`: percentage without a % sign; `>=` on Binance, `>` elsewhere.
 - `VOLUME_THRESHOLD`: USD-equivalent; comparison is `>=`.
 - `TZ`: IANA time zone, such as `UTC` or `Europe/Amsterdam`.
 
